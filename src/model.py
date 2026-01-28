@@ -71,7 +71,7 @@ class DigitCNN(nn.Module):
         x = F.max_pool2d(x, 2)  # 4x4 -> 2x2
 
         # Flatten and fully connected
-        x = x.view(x.size(0), -1)
+        x = x.flatten(1)
         x = F.relu(self.fc1(x))
         x = self.dropout1(x)
         x = F.relu(self.fc2(x))
@@ -83,7 +83,7 @@ class DigitCNN(nn.Module):
     def predict(self, x):
         """Get predicted class labels."""
         self.eval()
-        with torch.no_grad():
+        with torch.inference_mode():
             outputs = self.forward(x)
             _, predicted = torch.max(outputs, 1)
         return predicted
@@ -91,7 +91,7 @@ class DigitCNN(nn.Module):
     def predict_proba(self, x):
         """Get class probabilities."""
         self.eval()
-        with torch.no_grad():
+        with torch.inference_mode():
             outputs = self.forward(x)
             probabilities = F.softmax(outputs, dim=1)
         return probabilities

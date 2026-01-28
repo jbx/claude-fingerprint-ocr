@@ -34,7 +34,21 @@ def get_device():
     return torch.device('cpu')
 
 
-def load_model(model_path=None, device=None):
+def compile_model(model, device):
+    """
+    Compile model with torch.compile() using the appropriate backend for the device.
+
+    Note: MPS has limited torch.compile() support. We use aot_eager for inference.
+    """
+    if device.type == 'mps':
+        print("Compiling model with torch.compile(backend='aot_eager') for MPS inference...")
+        return torch.compile(model, backend='aot_eager')
+    else:
+        print("Compiling model with torch.compile()...")
+        return torch.compile(model)
+
+
+def load_model(model_path=None, device=None, use_compile=False, use_channels_last=False):
     """Load the trained model."""
     if model_path is None:
         model_path = MODELS_DIR / "model_v1.pth"
@@ -54,6 +68,12 @@ def load_model(model_path=None, device=None):
         model.load_state_dict(checkpoint)
 
     model = model.to(device)
+    if use_channels_last:
+        model = model.to(memory_format=torch.channels_last)
+
+    if use_compile:
+        model = compile_model(model, device)
+
     model.eval()
 
     return model, device
@@ -164,6 +184,95 @@ def preprocess_digit(digit_img, model_channels=3):
     return digit_tensor
 
 
+def extract_single_digit(image):
+    """
+    Extract a single digit from an image.
+
+    Useful when the digit fills most of the frame.
+    Attempts to isolate the digit from background using multiple strategies.
+    """
+    if len(image.shape) == 3:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = image.copy()
+
+    img_h, img_w = gray.shape
+    candidates = []
+
+    # Strategy 1: Threshold for bright pixels (light digit on dark/colored background)
+    # Find pixels significantly brighter than median
+    median_val = np.median(gray)
+    bright_thresh = min(240, int(median_val + (255 - median_val) * 0.6))
+    _, bright_mask = cv2.threshold(gray, bright_thresh, 255, cv2.THRESH_BINARY)
+    candidates.append(bright_mask)
+
+    # Strategy 2: Threshold for dark pixels (dark digit on light background)
+    dark_thresh = max(15, int(median_val * 0.4))
+    _, dark_mask = cv2.threshold(gray, dark_thresh, 255, cv2.THRESH_BINARY_INV)
+    candidates.append(dark_mask)
+
+    # Strategy 3: Otsu both ways
+    _, otsu1 = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    _, otsu2 = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    candidates.extend([otsu1, otsu2])
+
+    # Strategy 4: Color-based - if colored background, look for non-saturated pixels (white/black digit)
+    if len(image.shape) == 3:
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        # Low saturation = white/gray/black
+        low_sat_mask = cv2.inRange(hsv, (0, 0, 0), (180, 50, 255))
+        candidates.append(low_sat_mask)
+        # High value + low saturation = white
+        white_mask = cv2.inRange(hsv, (0, 0, 200), (180, 50, 255))
+        candidates.append(white_mask)
+
+    best_crop = None
+    best_score = 0
+
+    for mask in candidates:
+        # Clean up mask
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            continue
+
+        for contour in sorted(contours, key=cv2.contourArea, reverse=True)[:3]:
+            x, y, w, h = cv2.boundingRect(contour)
+            area = w * h
+            img_area = img_w * img_h
+            aspect_ratio = w / h if h > 0 else 0
+
+            # Skip if wrong size or aspect ratio
+            if area < img_area * 0.02 or area > img_area * 0.9:
+                continue
+            if aspect_ratio > 2.5 or aspect_ratio < 0.15:
+                continue
+
+            # Score: prefer centered, medium-sized regions
+            rel_area = area / img_area
+            size_score = rel_area * (1 - rel_area)  # Peaks at 0.5
+            center_x, center_y = x + w/2, y + h/2
+            center_score = 1 - (abs(center_x - img_w/2) / img_w + abs(center_y - img_h/2) / img_h)
+            score = size_score * center_score * 100
+
+            if score > best_score:
+                best_score = score
+                pad = max(5, int(min(w, h) * 0.2))
+                x1, y1 = max(0, x - pad), max(0, y - pad)
+                x2, y2 = min(img_w, x + w + pad), min(img_h, y + h + pad)
+                best_crop = image[y1:y2, x1:x2]
+
+    if best_crop is not None:
+        return [best_crop]
+
+    # Fallback: center crop
+    margin = min(img_h, img_w) // 6
+    return [image[margin:img_h-margin, margin:img_w-margin]]
+
+
 def segment_digits(image, min_area=100, max_area_ratio=0.5):
     """
     Segment individual digits from an image using contour detection.
@@ -259,12 +368,14 @@ def segment_digits(image, min_area=100, max_area_ratio=0.5):
     return [region[1] for region in digit_regions]
 
 
-def predict_single_digit(digit_img, model, device):
+def predict_single_digit(digit_img, model, device, use_channels_last=False):
     """Predict a single digit with confidence."""
     digit_tensor = preprocess_digit(digit_img, model_channels=model.in_channels)
-    digit_tensor = torch.from_numpy(digit_tensor).to(device)
+    digit_tensor = torch.from_numpy(digit_tensor).to(device, non_blocking=True)
+    if use_channels_last:
+        digit_tensor = digit_tensor.to(memory_format=torch.channels_last)
 
-    with torch.no_grad():
+    with torch.inference_mode():
         output = model(digit_tensor)
         probabilities = torch.softmax(output, dim=1)
         confidence, predicted = torch.max(probabilities, 1)
@@ -272,7 +383,8 @@ def predict_single_digit(digit_img, model, device):
     return predicted.item(), confidence.item(), probabilities[0].cpu().numpy()
 
 
-def predict_digits(image_path, model=None, device=None, visualize=False, confidence_threshold=0.3):
+def predict_digits(image_path, model=None, device=None, visualize=False, confidence_threshold=0.3,
+                   use_compile=False, use_channels_last=False, single_digit=False):
     """
     Detect and classify digits in an image.
 
@@ -282,21 +394,34 @@ def predict_digits(image_path, model=None, device=None, visualize=False, confide
         device: Torch device
         visualize: If True, save a visualization of the detected digits
         confidence_threshold: Minimum confidence to include a prediction
+        use_compile: Use torch.compile() for faster execution
+        use_channels_last: Use channels_last memory format
+        single_digit: If True, treat the entire image as a single digit (skip segmentation)
 
     Returns:
         String of detected digits in left-to-right order
     """
     # Load model if not provided
     if model is None:
-        model, device = load_model(device=device)
+        model, device = load_model(device=device, use_compile=use_compile, use_channels_last=use_channels_last)
 
     # Load image
     image = cv2.imread(str(image_path))
     if image is None:
         raise ValueError(f"Could not load image: {image_path}")
 
-    # Segment digits
-    digit_images = segment_digits(image)
+    # Extract digits based on mode
+    if single_digit:
+        print("Single-digit mode: processing entire image as one digit")
+        digit_images = extract_single_digit(image)
+    else:
+        # Try segmentation first
+        digit_images = segment_digits(image)
+
+        # Fallback to single-digit mode if segmentation finds nothing
+        if not digit_images:
+            print("No digits found via segmentation, trying single-digit mode...")
+            digit_images = extract_single_digit(image)
 
     if not digit_images:
         print("No digits detected in the image.")
@@ -308,7 +433,7 @@ def predict_digits(image_path, model=None, device=None, visualize=False, confide
     all_probabilities = []
 
     for digit_img in digit_images:
-        pred, conf, probs = predict_single_digit(digit_img, model, device)
+        pred, conf, probs = predict_single_digit(digit_img, model, device, use_channels_last=use_channels_last)
 
         # Only include if confidence is above threshold
         if conf >= confidence_threshold:
@@ -405,6 +530,9 @@ def main():
     parser.add_argument('--visualize', '-v', action='store_true', help='Save visualization')
     parser.add_argument('--threshold', '-t', type=float, default=0.3,
                         help='Confidence threshold (default: 0.3)')
+    parser.add_argument('--compile', action='store_true', help='Use torch.compile() for faster execution (PyTorch 2.0+)')
+    parser.add_argument('--channels-last', action='store_true', help='Use channels_last memory format for better cache utilization')
+    parser.add_argument('--single-digit', '-s', action='store_true', help='Treat the entire image as a single digit (skip segmentation)')
     args = parser.parse_args()
 
     # Check if image exists
@@ -423,7 +551,10 @@ def main():
     result = predict_digits(
         args.image,
         visualize=args.visualize,
-        confidence_threshold=args.threshold
+        confidence_threshold=args.threshold,
+        use_compile=args.compile,
+        use_channels_last=args.channels_last,
+        single_digit=args.single_digit
     )
 
     return result
