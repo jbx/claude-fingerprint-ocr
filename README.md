@@ -1,11 +1,13 @@
 # Multi-Digit OCR Classifier
 
-A machine learning project that trains a CNN classifier on the UCI Optical Recognition of Handwritten Digits dataset and provides multi-digit inference capabilities.
+A machine learning project that trains a CNN classifier on the SVHN (Street View House Numbers) dataset with data augmentation for robust real-world digit recognition.
 
 ## Features
 
-- **CNN-based digit classifier** trained on the UCI digits dataset
-- **Multi-digit recognition** using OpenCV contour detection
+- **CNN-based digit classifier** trained on real-world street number images (SVHN)
+- **Data augmentation** for improved generalization (rotation, scale, perspective, color jitter)
+- **Multi-digit recognition** using OpenCV contour detection with multiple thresholding strategies
+- **Improved preprocessing** with contrast enhancement and proper digit centering
 - **Proper data separation**: Training, Validation, and Test sets are strictly separated
 - **Early stopping** to prevent overfitting
 
@@ -15,9 +17,9 @@ A machine learning project that trains a CNN classifier on the UCI Optical Recog
 ├── data/               # Raw and processed data (git-ignored)
 ├── models/             # Saved model weights
 ├── src/
-│   ├── model.py        # CNN architecture definition
-│   ├── train.py        # Training script with validation logic
-│   └── predict.py      # Inference script for multi-digit images
+│   ├── model.py        # CNN architecture definition (32x32 RGB input)
+│   ├── train.py        # Training script with SVHN and data augmentation
+│   └── predict.py      # Inference script with improved preprocessing
 ├── requirements.txt    # Python dependencies
 └── README.md           # This file
 ```
@@ -45,22 +47,23 @@ A machine learning project that trains a CNN classifier on the UCI Optical Recog
 
 ### 1. Training
 
-Train the digit classifier:
+Train the digit classifier on SVHN:
 
 ```bash
 python src/train.py
 ```
 
 This will:
-- Automatically download the UCI Optical Recognition of Handwritten Digits dataset
-- Split data into Training (85% of original train), Validation (15% of original train), and Test sets
-- Train a CNN with early stopping based on validation loss
+- Automatically download the SVHN dataset (~400MB)
+- Split data into Training (90%), Validation (10%), and Test sets
+- Apply data augmentation during training
+- Train a CNN with early stopping based on validation accuracy
 - Save the best model to `models/model_v1.pth`
 - Evaluate on the held-out test set
 
 **Training options:**
 ```bash
-python src/train.py --epochs 100 --batch-size 64 --lr 0.001 --patience 10
+python src/train.py --epochs 50 --batch-size 128 --lr 0.001 --patience 10
 ```
 
 ### 2. Testing
@@ -83,52 +86,71 @@ python src/predict.py --image path/to/image.png
 - `--image`, `-i`: Path to input image (required)
 - `--model`, `-m`: Path to model weights (default: `models/model_v1.pth`)
 - `--visualize`, `-v`: Save a visualization of detected digits
+- `--threshold`, `-t`: Confidence threshold (default: 0.3)
 
 **Example:**
 ```bash
-python src/predict.py --image test_image.png --visualize
+python src/predict.py --image test_image.png --visualize --threshold 0.5
 ```
 
-## Data Pipeline
+## Data Augmentation
 
-### Data Separation
+Training uses the following augmentations to improve real-world robustness:
 
-The project ensures strict separation of data to prevent data leakage:
+| Augmentation | Description |
+|--------------|-------------|
+| Random Rotation | ±15 degrees |
+| Random Affine | Translation (10%), Scale (0.9-1.1), Shear (5°) |
+| Random Perspective | Distortion for varying viewpoints |
+| Color Jitter | Brightness, Contrast, Saturation, Hue variation |
+| Random Grayscale | 10% chance (helps with B&W images) |
+| Random Erasing | Simulates occlusions |
 
-1. **Training Set**: Used for model parameter updates
-2. **Validation Set**: Used for early stopping and hyperparameter tuning
-3. **Test Set**: Held out completely until final evaluation
+## Preprocessing Improvements
 
-The UCI dataset comes pre-split into `optdigits.tra` (training) and `optdigits.tes` (test). We further split the training file into training and validation sets (85%/15%).
+The inference pipeline includes:
 
-### Pre-processing
-
-- Pixel values are normalized from [0, 16] to [0, 1] range
-- Images are reshaped to (1, 8, 8) for CNN input
+1. **Multiple thresholding strategies**: Adaptive, Otsu, and inverted Otsu for different lighting conditions
+2. **Contrast enhancement**: CLAHE (Contrast Limited Adaptive Histogram Equalization)
+3. **Proper digit centering**: Mimics SVHN cropping style with padding
+4. **Duplicate region filtering**: Prevents double-detection of the same digit
+5. **Color preservation**: Maintains RGB information through the pipeline
 
 ## Model Architecture
 
-The CNN architecture:
-- 3 convolutional blocks with batch normalization and max pooling
-- Dropout (0.5) for regularization
-- Fully connected layers for classification
+The CNN architecture for 32x32 RGB input:
 
 ```
-Input: 8x8 grayscale image
-├── Conv2d(1, 32) + BatchNorm + ReLU + MaxPool2d
-├── Conv2d(32, 64) + BatchNorm + ReLU + MaxPool2d
-├── Conv2d(64, 128) + BatchNorm + ReLU + MaxPool2d
+Input: 32x32x3 RGB image
+├── Conv2d(3, 32) + BatchNorm + ReLU + MaxPool2d  → 16x16
+├── Conv2d(32, 64) + BatchNorm + ReLU + MaxPool2d → 8x8
+├── Conv2d(64, 128) + BatchNorm + ReLU + MaxPool2d → 4x4
+├── Conv2d(128, 256) + BatchNorm + ReLU + MaxPool2d → 2x2
 ├── Flatten
-├── Linear(128, 256) + ReLU + Dropout(0.5)
-└── Linear(256, 10)
+├── Linear(1024, 512) + ReLU + Dropout(0.5)
+├── Linear(512, 128) + ReLU + Dropout(0.3)
+└── Linear(128, 10)
 Output: 10 class probabilities
 ```
 
+## Why SVHN?
+
+The SVHN (Street View House Numbers) dataset was chosen over UCI digits because:
+
+| Aspect | UCI Digits | SVHN |
+|--------|-----------|------|
+| Resolution | 8x8 | 32x32 |
+| Type | Handwritten (processed) | Real photographs |
+| Variation | Limited | High (lighting, fonts, backgrounds) |
+| Real-world robustness | Low | High |
+
 ## Success Criteria
 
-- [x] Model achieves >95% accuracy on unseen test set
-- [x] System distinguishes between multiple digits in a single image
-- [x] Clear documentation shows test set was not used during training
+- [x] Model trained on real-world digit images (SVHN)
+- [x] Data augmentation for improved generalization
+- [x] Multiple thresholding strategies for robust segmentation
+- [x] Proper preprocessing with contrast enhancement
+- [x] Clear documentation of data separation
 
 ## License
 
