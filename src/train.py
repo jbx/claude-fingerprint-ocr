@@ -138,28 +138,45 @@ def prepare_data():
     return train_subset, val_subset, test_dataset
 
 
-def create_dataloaders(train_dataset, val_dataset, test_dataset, batch_size=128):
-    """Create PyTorch DataLoaders."""
+def get_device():
+    """Get the best available device (MPS for Apple Silicon, CUDA, or CPU)."""
+    if torch.backends.mps.is_available():
+        return torch.device('mps')
+    elif torch.cuda.is_available():
+        return torch.device('cuda')
+    return torch.device('cpu')
+
+
+def create_dataloaders(train_dataset, val_dataset, test_dataset, batch_size=128, device=None):
+    """Create PyTorch DataLoaders optimized for the current device."""
+    # MPS doesn't support pin_memory, and works better with fewer workers
+    use_mps = device is not None and device.type == 'mps'
+    num_workers = 0 if use_mps else 4
+    pin_memory = not use_mps and torch.cuda.is_available()
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=2,
-        pin_memory=True
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=num_workers > 0
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=2,
-        pin_memory=True
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=num_workers > 0
     )
     test_loader = DataLoader(
         test_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=2,
-        pin_memory=True
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=num_workers > 0
     )
 
     return train_loader, val_loader, test_loader
@@ -335,14 +352,14 @@ def load_model_checkpoint(filepath, device):
 def main():
     parser = argparse.ArgumentParser(description='Train digit classifier on SVHN dataset')
     parser.add_argument('--epochs', type=int, default=50, help='Maximum training epochs')
-    parser.add_argument('--batch-size', type=int, default=128, help='Batch size')
+    parser.add_argument('--batch-size', type=int, default=256, help='Batch size (default 256 for Apple Silicon)')
     parser.add_argument('--lr', type=float, default=0.001, help='Learning rate')
     parser.add_argument('--patience', type=int, default=10, help='Early stopping patience')
     parser.add_argument('--test-only', action='store_true', help='Only run test evaluation')
     args = parser.parse_args()
 
-    # Set device
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # Set device (prefers MPS on Apple Silicon, then CUDA, then CPU)
+    device = get_device()
     print(f"Using device: {device}")
 
     # Prepare data
@@ -360,7 +377,7 @@ def main():
         else:
             print(f"Error: No model found at {model_path}")
             return
-        _, _, test_loader = create_dataloaders(train_dataset, val_dataset, test_dataset, args.batch_size)
+        _, _, test_loader = create_dataloaders(train_dataset, val_dataset, test_dataset, args.batch_size, device)
     else:
         # Create model
         model = DigitCNN(in_channels=3)
@@ -368,7 +385,7 @@ def main():
 
         # Create dataloaders
         train_loader, val_loader, test_loader = create_dataloaders(
-            train_dataset, val_dataset, test_dataset, args.batch_size
+            train_dataset, val_dataset, test_dataset, args.batch_size, device
         )
 
         # Train model

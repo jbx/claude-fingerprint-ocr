@@ -25,13 +25,22 @@ SVHN_MEAN = (0.4377, 0.4438, 0.4728)
 SVHN_STD = (0.1980, 0.2010, 0.1970)
 
 
+def get_device():
+    """Get the best available device (MPS for Apple Silicon, CUDA, or CPU)."""
+    if torch.backends.mps.is_available():
+        return torch.device('mps')
+    elif torch.cuda.is_available():
+        return torch.device('cuda')
+    return torch.device('cpu')
+
+
 def load_model(model_path=None, device=None):
     """Load the trained model."""
     if model_path is None:
         model_path = MODELS_DIR / "model_v1.pth"
 
     if device is None:
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        device = get_device()
 
     checkpoint = torch.load(model_path, map_location=device)
 
