@@ -12,7 +12,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Subset, ConcatDataset
 from torchvision import datasets, transforms
 from sklearn.metrics import accuracy_score, confusion_matrix, classification_report
 
@@ -81,61 +81,168 @@ def get_val_transforms():
     ])
 
 
-def prepare_data():
+def get_mnist_train_transforms():
     """
-    Download and prepare the SVHN dataset with train/val/test splits.
+    Get training transforms for MNIST dataset.
+
+    MNIST is 28x28 grayscale, so we:
+    1. Resize to 32x32 to match SVHN
+    2. Convert grayscale to RGB (3 channels)
+    3. Apply similar augmentations as SVHN
+    """
+    return transforms.Compose([
+        # Resize to match SVHN dimensions
+        transforms.Resize((32, 32)),
+
+        # Convert grayscale to RGB
+        transforms.Grayscale(num_output_channels=3),
+
+        # Geometric augmentations (same as SVHN)
+        transforms.RandomRotation(15),
+        transforms.RandomAffine(
+            degrees=0,
+            translate=(0.1, 0.1),
+            scale=(0.9, 1.1),
+            shear=5
+        ),
+        transforms.RandomPerspective(distortion_scale=0.2, p=0.3),
+
+        # Color augmentations (simulate different backgrounds/lighting)
+        transforms.ColorJitter(
+            brightness=0.3,
+            contrast=0.3,
+        ),
+
+        # Convert to tensor
+        transforms.ToTensor(),
+
+        # Random erasing (simulates occlusions)
+        transforms.RandomErasing(p=0.2, scale=(0.02, 0.15)),
+
+        # Normalize with SVHN stats for consistency
+        transforms.Normalize(SVHN_MEAN, SVHN_STD),
+    ])
+
+
+def get_mnist_val_transforms():
+    """Get validation transforms for MNIST (resize and convert to RGB)."""
+    return transforms.Compose([
+        transforms.Resize((32, 32)),
+        transforms.Grayscale(num_output_channels=3),
+        transforms.ToTensor(),
+        transforms.Normalize(SVHN_MEAN, SVHN_STD),
+    ])
+
+
+def prepare_data(use_multi_dataset=False):
+    """
+    Download and prepare datasets with train/val/test splits.
+
+    Args:
+        use_multi_dataset: If True, combine SVHN with MNIST for better generalization
 
     SVHN (Street View House Numbers) contains real-world digit images
     cropped from Google Street View imagery.
 
+    MNIST contains handwritten digits, providing a different domain.
+
     Returns:
-        Tuple of (train_loader, val_loader, test_loader)
+        Tuple of (train_dataset, val_dataset, test_dataset)
     """
     DATA_DIR.mkdir(exist_ok=True)
 
+    # === SVHN Dataset ===
     print("Downloading/loading SVHN dataset...")
 
-    # Training set with augmentation
-    train_dataset = datasets.SVHN(
+    svhn_train = datasets.SVHN(
         root=DATA_DIR,
         split='train',
         download=True,
         transform=get_train_transforms()
     )
 
-    # Use a portion of the training set for validation (10%)
-    n_train = len(train_dataset)
-    n_val = int(0.1 * n_train)
+    # Use a portion of SVHN training set for validation (10%)
+    n_svhn = len(svhn_train)
+    n_val_svhn = int(0.1 * n_svhn)
 
-    # Create indices for train/val split
-    indices = np.random.RandomState(42).permutation(n_train)
-    train_indices = indices[n_val:]
-    val_indices = indices[:n_val]
+    indices = np.random.RandomState(42).permutation(n_svhn)
+    train_indices_svhn = indices[n_val_svhn:]
+    val_indices_svhn = indices[:n_val_svhn]
 
-    # Create validation dataset with no augmentation
-    val_dataset_base = datasets.SVHN(
+    svhn_val_base = datasets.SVHN(
         root=DATA_DIR,
         split='train',
         download=True,
         transform=get_val_transforms()
     )
 
-    train_subset = Subset(train_dataset, train_indices)
-    val_subset = Subset(val_dataset_base, val_indices)
+    svhn_train_subset = Subset(svhn_train, train_indices_svhn)
+    svhn_val_subset = Subset(svhn_val_base, val_indices_svhn)
 
-    # Test set
-    test_dataset = datasets.SVHN(
+    svhn_test = datasets.SVHN(
         root=DATA_DIR,
         split='test',
         download=True,
         transform=get_val_transforms()
     )
 
-    print(f"Training set size: {len(train_subset)}")
-    print(f"Validation set size: {len(val_subset)}")
-    print(f"Test set size (held out): {len(test_dataset)}")
+    if use_multi_dataset:
+        # === MNIST Dataset ===
+        print("Downloading/loading MNIST dataset...")
 
-    return train_subset, val_subset, test_dataset
+        mnist_train = datasets.MNIST(
+            root=DATA_DIR,
+            train=True,
+            download=True,
+            transform=get_mnist_train_transforms()
+        )
+
+        # Use 10% of MNIST for validation
+        n_mnist = len(mnist_train)
+        n_val_mnist = int(0.1 * n_mnist)
+
+        indices_mnist = np.random.RandomState(42).permutation(n_mnist)
+        train_indices_mnist = indices_mnist[n_val_mnist:]
+        val_indices_mnist = indices_mnist[:n_val_mnist]
+
+        mnist_val_base = datasets.MNIST(
+            root=DATA_DIR,
+            train=True,
+            download=True,
+            transform=get_mnist_val_transforms()
+        )
+
+        mnist_train_subset = Subset(mnist_train, train_indices_mnist)
+        mnist_val_subset = Subset(mnist_val_base, val_indices_mnist)
+
+        mnist_test = datasets.MNIST(
+            root=DATA_DIR,
+            train=False,
+            download=True,
+            transform=get_mnist_val_transforms()
+        )
+
+        # Combine datasets
+        train_dataset = ConcatDataset([svhn_train_subset, mnist_train_subset])
+        val_dataset = ConcatDataset([svhn_val_subset, mnist_val_subset])
+        # Keep test sets separate for evaluation - use SVHN as primary test
+        test_dataset = svhn_test
+
+        print(f"\nMulti-dataset training enabled:")
+        print(f"  SVHN train: {len(svhn_train_subset)}, val: {len(svhn_val_subset)}")
+        print(f"  MNIST train: {len(mnist_train_subset)}, val: {len(mnist_val_subset)}")
+        print(f"  Combined train: {len(train_dataset)}, val: {len(val_dataset)}")
+        print(f"  Test set (SVHN): {len(test_dataset)}")
+    else:
+        train_dataset = svhn_train_subset
+        val_dataset = svhn_val_subset
+        test_dataset = svhn_test
+
+        print(f"Training set size: {len(train_dataset)}")
+        print(f"Validation set size: {len(val_dataset)}")
+        print(f"Test set size (held out): {len(test_dataset)}")
+
+    return train_dataset, val_dataset, test_dataset
 
 
 def get_device():
@@ -145,6 +252,31 @@ def get_device():
     elif torch.cuda.is_available():
         return torch.device('cuda')
     return torch.device('cpu')
+
+
+def compile_model(model, device, training=True):
+    """
+    Compile model with torch.compile() using the appropriate backend for the device.
+
+    Args:
+        model: The model to compile
+        device: The target device
+        training: If True, model will be used for training (backward pass needed)
+
+    Note: MPS doesn't fully support torch.compile() yet, especially for training.
+    """
+    if device.type == 'mps':
+        if training:
+            print("Warning: torch.compile() is not fully supported on MPS for training.")
+            print("Skipping compilation. Other optimizations (channels_last, inference_mode) still apply.")
+            return model
+        else:
+            # For inference-only, aot_eager might work
+            print("Compiling model with torch.compile(backend='aot_eager') for MPS inference...")
+            return torch.compile(model, backend='aot_eager')
+    else:
+        print("Compiling model with torch.compile()...")
+        return torch.compile(model)
 
 
 def create_dataloaders(train_dataset, val_dataset, test_dataset, batch_size=128, device=None):
@@ -182,7 +314,7 @@ def create_dataloaders(train_dataset, val_dataset, test_dataset, batch_size=128,
     return train_loader, val_loader, test_loader
 
 
-def train_model(model, train_loader, val_loader, device, epochs=50, patience=10, lr=0.001):
+def train_model(model, train_loader, val_loader, device, epochs=50, patience=10, lr=0.001, use_channels_last=False):
     """
     Train the model with early stopping based on validation loss.
 
@@ -194,11 +326,20 @@ def train_model(model, train_loader, val_loader, device, epochs=50, patience=10,
         epochs: Maximum number of epochs
         patience: Early stopping patience
         lr: Learning rate
+        use_channels_last: Use channels_last memory format for better performance
 
     Returns:
         Trained model and training history
     """
+    # channels_last has backward pass issues on MPS
+    if use_channels_last and device.type == 'mps':
+        print("Warning: channels_last is not fully supported on MPS for training.")
+        print("Skipping channels_last. Other optimizations (non_blocking, inference_mode) still apply.")
+        use_channels_last = False
+
     model = model.to(device)
+    if use_channels_last:
+        model = model.to(memory_format=torch.channels_last)
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.OneCycleLR(
@@ -223,7 +364,10 @@ def train_model(model, train_loader, val_loader, device, epochs=50, patience=10,
         train_total = 0
 
         for inputs, labels in train_loader:
-            inputs, labels = inputs.to(device), labels.to(device)
+            inputs = inputs.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+            if use_channels_last:
+                inputs = inputs.to(memory_format=torch.channels_last)
 
             optimizer.zero_grad()
             outputs = model(inputs)
@@ -246,9 +390,12 @@ def train_model(model, train_loader, val_loader, device, epochs=50, patience=10,
         val_correct = 0
         val_total = 0
 
-        with torch.no_grad():
+        with torch.inference_mode():
             for inputs, labels in val_loader:
-                inputs, labels = inputs.to(device), labels.to(device)
+                inputs = inputs.to(device, non_blocking=True)
+                labels = labels.to(device, non_blocking=True)
+                if use_channels_last:
+                    inputs = inputs.to(memory_format=torch.channels_last)
                 outputs = model(inputs)
                 loss = criterion(outputs, labels)
 
@@ -288,21 +435,29 @@ def train_model(model, train_loader, val_loader, device, epochs=50, patience=10,
     return model, history
 
 
-def evaluate_model(model, test_loader, device):
+def evaluate_model(model, test_loader, device, use_channels_last=False):
     """
     Evaluate the model on the test set.
 
     Returns accuracy and prints confusion matrix and classification report.
     """
+    # channels_last can have issues on MPS, skip it for consistency
+    if use_channels_last and device.type == 'mps':
+        use_channels_last = False
+
     model.eval()
     model = model.to(device)
+    if use_channels_last:
+        model = model.to(memory_format=torch.channels_last)
 
     all_predictions = []
     all_labels = []
 
-    with torch.no_grad():
+    with torch.inference_mode():
         for inputs, labels in test_loader:
-            inputs = inputs.to(device)
+            inputs = inputs.to(device, non_blocking=True)
+            if use_channels_last:
+                inputs = inputs.to(memory_format=torch.channels_last)
             outputs = model(inputs)
             _, predictions = torch.max(outputs, 1)
             all_predictions.extend(predictions.cpu().numpy())
@@ -349,6 +504,148 @@ def load_model_checkpoint(filepath, device):
     return model, checkpoint
 
 
+def train_ensemble(n_models, train_loader, val_loader, device, epochs=50, patience=10, lr=0.001, use_channels_last=False):
+    """
+    Train an ensemble of models with different random seeds.
+
+    Each model sees the same data but with different weight initialization,
+    leading to diverse predictions that improve when combined.
+    """
+    models = []
+    histories = []
+
+    for i in range(n_models):
+        print(f"\n{'='*50}")
+        print(f"TRAINING ENSEMBLE MODEL {i+1}/{n_models}")
+        print(f"{'='*50}")
+
+        # Set different seed for each model
+        seed = 42 + i * 1000
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+
+        # Create fresh model
+        model = DigitCNN(in_channels=3)
+
+        # Train
+        model, history = train_model(
+            model, train_loader, val_loader, device,
+            epochs=epochs, patience=patience, lr=lr,
+            use_channels_last=use_channels_last
+        )
+
+        models.append(model)
+        histories.append(history)
+
+        # Print individual model performance
+        final_val_acc = history['val_acc'][-1] if history['val_acc'] else 0
+        print(f"Model {i+1} final validation accuracy: {final_val_acc:.4f}")
+
+    return models, histories
+
+
+def evaluate_ensemble(models, test_loader, device, use_channels_last=False):
+    """
+    Evaluate an ensemble of models using probability averaging.
+
+    Probability averaging is more robust than voting because it considers
+    the confidence of each model's predictions.
+    """
+    # channels_last can have issues on MPS, skip it for consistency
+    if use_channels_last and device.type == 'mps':
+        use_channels_last = False
+
+    for model in models:
+        model.eval()
+        model.to(device)
+        if use_channels_last:
+            model.to(memory_format=torch.channels_last)
+
+    all_predictions = []
+    all_labels = []
+    all_avg_confidences = []
+
+    with torch.inference_mode():
+        for inputs, labels in test_loader:
+            inputs = inputs.to(device, non_blocking=True)
+            if use_channels_last:
+                inputs = inputs.to(memory_format=torch.channels_last)
+
+            # Get predictions from all models
+            ensemble_probs = []
+            for model in models:
+                outputs = model(inputs)
+                probs = torch.softmax(outputs, dim=1)
+                ensemble_probs.append(probs)
+
+            # Average probabilities across models
+            avg_probs = torch.stack(ensemble_probs).mean(dim=0)
+
+            # Get final predictions
+            confidences, predictions = torch.max(avg_probs, dim=1)
+
+            all_predictions.extend(predictions.cpu().numpy())
+            all_labels.extend(labels.numpy())
+            all_avg_confidences.extend(confidences.cpu().numpy())
+
+    all_predictions = np.array(all_predictions)
+    all_labels = np.array(all_labels)
+
+    accuracy = accuracy_score(all_labels, all_predictions)
+    avg_confidence = np.mean(all_avg_confidences)
+
+    print("\n" + "="*50)
+    print(f"ENSEMBLE TEST RESULTS ({len(models)} models)")
+    print("="*50)
+    print(f"\nEnsemble Accuracy: {accuracy:.4f} ({accuracy*100:.2f}%)")
+    print(f"Average Confidence: {avg_confidence:.4f}")
+
+    print("\nConfusion Matrix:")
+    cm = confusion_matrix(all_labels, all_predictions)
+    print(cm)
+
+    print("\nClassification Report:")
+    print(classification_report(all_labels, all_predictions))
+
+    return accuracy
+
+
+def save_ensemble(models, base_path):
+    """Save all ensemble models."""
+    MODELS_DIR.mkdir(exist_ok=True)
+    paths = []
+    for i, model in enumerate(models):
+        path = base_path.parent / f"{base_path.stem}_ensemble_{i}.pth"
+        torch.save({
+            'model_state_dict': model.state_dict(),
+            'in_channels': model.in_channels,
+            'svhn_mean': SVHN_MEAN,
+            'svhn_std': SVHN_STD,
+            'ensemble_index': i,
+            'ensemble_size': len(models),
+        }, path)
+        paths.append(path)
+        print(f"Saved ensemble model {i+1}/{len(models)} to {path}")
+    return paths
+
+
+def load_ensemble(base_path, device):
+    """Load all ensemble models from disk."""
+    models = []
+    i = 0
+    while True:
+        path = base_path.parent / f"{base_path.stem}_ensemble_{i}.pth"
+        if not path.exists():
+            break
+        model, _ = load_model_checkpoint(path, device)
+        models.append(model)
+        i += 1
+
+    if models:
+        print(f"Loaded ensemble of {len(models)} models")
+    return models
+
+
 def main():
     parser = argparse.ArgumentParser(description='Train digit classifier on SVHN dataset')
     parser.add_argument('--epochs', type=int, default=50, help='Maximum training epochs')
@@ -356,6 +653,10 @@ def main():
     parser.add_argument('--lr', type=float, default=0.001, help='Learning rate')
     parser.add_argument('--patience', type=int, default=10, help='Early stopping patience')
     parser.add_argument('--test-only', action='store_true', help='Only run test evaluation')
+    parser.add_argument('--compile', action='store_true', help='Use torch.compile() for faster execution (PyTorch 2.0+)')
+    parser.add_argument('--channels-last', action='store_true', help='Use channels_last memory format for better cache utilization')
+    parser.add_argument('--multi-dataset', action='store_true', help='Train on SVHN + MNIST for better generalization')
+    parser.add_argument('--ensemble', type=int, default=0, metavar='N', help='Train N models for ensemble (0 = single model)')
     args = parser.parse_args()
 
     # Set device (prefers MPS on Apple Silicon, then CUDA, then CPU)
@@ -364,31 +665,67 @@ def main():
 
     # Prepare data
     print("\n" + "="*50)
-    print("PREPARING DATA (SVHN Dataset)")
+    if args.multi_dataset:
+        print("PREPARING DATA (SVHN + MNIST)")
+    else:
+        print("PREPARING DATA (SVHN Dataset)")
     print("="*50)
-    train_dataset, val_dataset, test_dataset = prepare_data()
+    train_dataset, val_dataset, test_dataset = prepare_data(use_multi_dataset=args.multi_dataset)
 
     model_path = MODELS_DIR / "model_v1.pth"
 
+    # Create dataloaders
+    train_loader, val_loader, test_loader = create_dataloaders(
+        train_dataset, val_dataset, test_dataset, args.batch_size, device
+    )
+
+    use_ensemble = args.ensemble > 1
+
     if args.test_only:
-        if model_path.exists():
-            model, _ = load_model_checkpoint(model_path, device)
-            print(f"Loaded model from {model_path}")
+        # Load and evaluate existing model(s)
+        if use_ensemble:
+            models = load_ensemble(model_path, device)
+            if not models:
+                print(f"Error: No ensemble models found at {model_path.parent}")
+                return
+            accuracy = evaluate_ensemble(models, test_loader, device, use_channels_last=args.channels_last)
         else:
-            print(f"Error: No model found at {model_path}")
-            return
-        _, _, test_loader = create_dataloaders(train_dataset, val_dataset, test_dataset, args.batch_size, device)
+            if model_path.exists():
+                model, _ = load_model_checkpoint(model_path, device)
+                print(f"Loaded model from {model_path}")
+            else:
+                print(f"Error: No model found at {model_path}")
+                return
+            if args.compile:
+                model = compile_model(model, device, training=False)
+            accuracy = evaluate_model(model, test_loader, device, use_channels_last=args.channels_last)
+    elif use_ensemble:
+        # Train ensemble
+        print("\n" + "="*50)
+        print(f"TRAINING ENSEMBLE ({args.ensemble} models)")
+        print("="*50)
+        print("Note: The test set is NOT used during training.")
+        print("Data augmentation is applied to training data.\n")
+
+        models, histories = train_ensemble(
+            args.ensemble, train_loader, val_loader, device,
+            epochs=args.epochs, patience=args.patience, lr=args.lr,
+            use_channels_last=args.channels_last
+        )
+
+        # Save ensemble
+        save_ensemble(models, model_path)
+
+        # Evaluate ensemble
+        accuracy = evaluate_ensemble(models, test_loader, device, use_channels_last=args.channels_last)
     else:
-        # Create model
+        # Train single model
         model = DigitCNN(in_channels=3)
         print(f"\nModel architecture:\n{model}")
 
-        # Create dataloaders
-        train_loader, val_loader, test_loader = create_dataloaders(
-            train_dataset, val_dataset, test_dataset, args.batch_size, device
-        )
+        if args.compile:
+            model = compile_model(model, device, training=True)
 
-        # Train model
         print("\n" + "="*50)
         print("TRAINING MODEL")
         print("="*50)
@@ -397,14 +734,15 @@ def main():
 
         model, history = train_model(
             model, train_loader, val_loader, device,
-            epochs=args.epochs, patience=args.patience, lr=args.lr
+            epochs=args.epochs, patience=args.patience, lr=args.lr,
+            use_channels_last=args.channels_last
         )
 
         # Save model
         save_model(model, model_path)
 
-    # Evaluate on test set
-    accuracy = evaluate_model(model, test_loader, device)
+        # Evaluate
+        accuracy = evaluate_model(model, test_loader, device, use_channels_last=args.channels_last)
 
     # Check success criteria
     print("\n" + "="*50)
