@@ -79,6 +79,38 @@ def load_model(model_path=None, device=None, use_compile=False, use_channels_las
     return model, device
 
 
+def load_ensemble(model_path=None, device=None, use_channels_last=False):
+    """Load all ensemble models from disk."""
+    if model_path is None:
+        model_path = MODELS_DIR / "model_v1.pth"
+
+    if device is None:
+        device = get_device()
+
+    models = []
+    i = 0
+    while True:
+        path = model_path.parent / f"{model_path.stem}_ensemble_{i}.pth"
+        if not path.exists():
+            break
+
+        checkpoint = torch.load(path, map_location=device)
+        in_channels = checkpoint.get('in_channels', 3)
+        model = DigitCNN(in_channels=in_channels)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        model = model.to(device)
+        if use_channels_last:
+            model = model.to(memory_format=torch.channels_last)
+        model.eval()
+        models.append(model)
+        i += 1
+
+    if models:
+        print(f"Loaded ensemble of {len(models)} models")
+
+    return models, device
+
+
 def center_digit_in_square(digit_img, target_size=32, padding_ratio=0.2):
     """
     Center the digit in a square image with padding.
@@ -383,26 +415,60 @@ def predict_single_digit(digit_img, model, device, use_channels_last=False):
     return predicted.item(), confidence.item(), probabilities[0].cpu().numpy()
 
 
-def predict_digits(image_path, model=None, device=None, visualize=False, confidence_threshold=0.3,
-                   use_compile=False, use_channels_last=False, single_digit=False):
+def predict_single_digit_ensemble(digit_img, models, device, use_channels_last=False):
+    """
+    Predict a single digit using an ensemble of models.
+
+    Uses probability averaging for more robust predictions.
+    """
+    digit_tensor = preprocess_digit(digit_img, model_channels=models[0].in_channels)
+    digit_tensor = torch.from_numpy(digit_tensor).to(device, non_blocking=True)
+    if use_channels_last:
+        digit_tensor = digit_tensor.to(memory_format=torch.channels_last)
+
+    with torch.inference_mode():
+        ensemble_probs = []
+        for model in models:
+            output = model(digit_tensor)
+            probs = torch.softmax(output, dim=1)
+            ensemble_probs.append(probs)
+
+        # Average probabilities
+        avg_probs = torch.stack(ensemble_probs).mean(dim=0)
+        confidence, predicted = torch.max(avg_probs, dim=1)
+
+    return predicted.item(), confidence.item(), avg_probs[0].cpu().numpy()
+
+
+def predict_digits(image_path, model=None, models=None, device=None, visualize=False, confidence_threshold=0.3,
+                   use_compile=False, use_channels_last=False, single_digit=False, use_ensemble=False):
     """
     Detect and classify digits in an image.
 
     Args:
         image_path: Path to the input image
-        model: Trained model (will load if None)
+        model: Trained model (will load if None, ignored if use_ensemble=True)
+        models: List of ensemble models (will load if None and use_ensemble=True)
         device: Torch device
         visualize: If True, save a visualization of the detected digits
         confidence_threshold: Minimum confidence to include a prediction
         use_compile: Use torch.compile() for faster execution
         use_channels_last: Use channels_last memory format
         single_digit: If True, treat the entire image as a single digit (skip segmentation)
+        use_ensemble: If True, use ensemble of models for prediction
 
     Returns:
         String of detected digits in left-to-right order
     """
-    # Load model if not provided
-    if model is None:
+    # Load model(s) if not provided
+    if use_ensemble:
+        if models is None:
+            models, device = load_ensemble(device=device, use_channels_last=use_channels_last)
+            if not models:
+                print("No ensemble models found, falling back to single model")
+                use_ensemble = False
+
+    if not use_ensemble and model is None:
         model, device = load_model(device=device, use_compile=use_compile, use_channels_last=use_channels_last)
 
     # Load image
@@ -433,7 +499,10 @@ def predict_digits(image_path, model=None, device=None, visualize=False, confide
     all_probabilities = []
 
     for digit_img in digit_images:
-        pred, conf, probs = predict_single_digit(digit_img, model, device, use_channels_last=use_channels_last)
+        if use_ensemble:
+            pred, conf, probs = predict_single_digit_ensemble(digit_img, models, device, use_channels_last=use_channels_last)
+        else:
+            pred, conf, probs = predict_single_digit(digit_img, model, device, use_channels_last=use_channels_last)
 
         # Only include if confidence is above threshold
         if conf >= confidence_threshold:
@@ -533,6 +602,7 @@ def main():
     parser.add_argument('--compile', action='store_true', help='Use torch.compile() for faster execution (PyTorch 2.0+)')
     parser.add_argument('--channels-last', action='store_true', help='Use channels_last memory format for better cache utilization')
     parser.add_argument('--single-digit', '-s', action='store_true', help='Treat the entire image as a single digit (skip segmentation)')
+    parser.add_argument('--ensemble', '-e', action='store_true', help='Use ensemble of models for more robust predictions')
     args = parser.parse_args()
 
     # Check if image exists
@@ -540,12 +610,21 @@ def main():
         print(f"Error: Image not found: {args.image}")
         sys.exit(1)
 
-    # Check if model exists
-    model_path = args.model if args.model else MODELS_DIR / "model_v1.pth"
-    if not Path(model_path).exists():
-        print(f"Error: Model not found: {model_path}")
-        print("Please run train.py first to train the model.")
-        sys.exit(1)
+    # Check if model(s) exist
+    model_path = Path(args.model) if args.model else MODELS_DIR / "model_v1.pth"
+
+    if args.ensemble:
+        # Check for ensemble models
+        ensemble_path = model_path.parent / f"{model_path.stem}_ensemble_0.pth"
+        if not ensemble_path.exists():
+            print(f"Error: No ensemble models found at {model_path.parent}")
+            print("Please run train.py with --ensemble N first to train an ensemble.")
+            sys.exit(1)
+    else:
+        if not model_path.exists():
+            print(f"Error: Model not found: {model_path}")
+            print("Please run train.py first to train the model.")
+            sys.exit(1)
 
     # Run prediction
     result = predict_digits(
@@ -554,7 +633,8 @@ def main():
         confidence_threshold=args.threshold,
         use_compile=args.compile,
         use_channels_last=args.channels_last,
-        single_digit=args.single_digit
+        single_digit=args.single_digit,
+        use_ensemble=args.ensemble
     )
 
     return result

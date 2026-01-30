@@ -504,6 +504,148 @@ def load_model_checkpoint(filepath, device):
     return model, checkpoint
 
 
+def train_ensemble(n_models, train_loader, val_loader, device, epochs=50, patience=10, lr=0.001, use_channels_last=False):
+    """
+    Train an ensemble of models with different random seeds.
+
+    Each model sees the same data but with different weight initialization,
+    leading to diverse predictions that improve when combined.
+    """
+    models = []
+    histories = []
+
+    for i in range(n_models):
+        print(f"\n{'='*50}")
+        print(f"TRAINING ENSEMBLE MODEL {i+1}/{n_models}")
+        print(f"{'='*50}")
+
+        # Set different seed for each model
+        seed = 42 + i * 1000
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+
+        # Create fresh model
+        model = DigitCNN(in_channels=3)
+
+        # Train
+        model, history = train_model(
+            model, train_loader, val_loader, device,
+            epochs=epochs, patience=patience, lr=lr,
+            use_channels_last=use_channels_last
+        )
+
+        models.append(model)
+        histories.append(history)
+
+        # Print individual model performance
+        final_val_acc = history['val_acc'][-1] if history['val_acc'] else 0
+        print(f"Model {i+1} final validation accuracy: {final_val_acc:.4f}")
+
+    return models, histories
+
+
+def evaluate_ensemble(models, test_loader, device, use_channels_last=False):
+    """
+    Evaluate an ensemble of models using probability averaging.
+
+    Probability averaging is more robust than voting because it considers
+    the confidence of each model's predictions.
+    """
+    # channels_last can have issues on MPS, skip it for consistency
+    if use_channels_last and device.type == 'mps':
+        use_channels_last = False
+
+    for model in models:
+        model.eval()
+        model.to(device)
+        if use_channels_last:
+            model.to(memory_format=torch.channels_last)
+
+    all_predictions = []
+    all_labels = []
+    all_avg_confidences = []
+
+    with torch.inference_mode():
+        for inputs, labels in test_loader:
+            inputs = inputs.to(device, non_blocking=True)
+            if use_channels_last:
+                inputs = inputs.to(memory_format=torch.channels_last)
+
+            # Get predictions from all models
+            ensemble_probs = []
+            for model in models:
+                outputs = model(inputs)
+                probs = torch.softmax(outputs, dim=1)
+                ensemble_probs.append(probs)
+
+            # Average probabilities across models
+            avg_probs = torch.stack(ensemble_probs).mean(dim=0)
+
+            # Get final predictions
+            confidences, predictions = torch.max(avg_probs, dim=1)
+
+            all_predictions.extend(predictions.cpu().numpy())
+            all_labels.extend(labels.numpy())
+            all_avg_confidences.extend(confidences.cpu().numpy())
+
+    all_predictions = np.array(all_predictions)
+    all_labels = np.array(all_labels)
+
+    accuracy = accuracy_score(all_labels, all_predictions)
+    avg_confidence = np.mean(all_avg_confidences)
+
+    print("\n" + "="*50)
+    print(f"ENSEMBLE TEST RESULTS ({len(models)} models)")
+    print("="*50)
+    print(f"\nEnsemble Accuracy: {accuracy:.4f} ({accuracy*100:.2f}%)")
+    print(f"Average Confidence: {avg_confidence:.4f}")
+
+    print("\nConfusion Matrix:")
+    cm = confusion_matrix(all_labels, all_predictions)
+    print(cm)
+
+    print("\nClassification Report:")
+    print(classification_report(all_labels, all_predictions))
+
+    return accuracy
+
+
+def save_ensemble(models, base_path):
+    """Save all ensemble models."""
+    MODELS_DIR.mkdir(exist_ok=True)
+    paths = []
+    for i, model in enumerate(models):
+        path = base_path.parent / f"{base_path.stem}_ensemble_{i}.pth"
+        torch.save({
+            'model_state_dict': model.state_dict(),
+            'in_channels': model.in_channels,
+            'svhn_mean': SVHN_MEAN,
+            'svhn_std': SVHN_STD,
+            'ensemble_index': i,
+            'ensemble_size': len(models),
+        }, path)
+        paths.append(path)
+        print(f"Saved ensemble model {i+1}/{len(models)} to {path}")
+    return paths
+
+
+def load_ensemble(base_path, device):
+    """Load all ensemble models from disk."""
+    models = []
+    i = 0
+    while True:
+        path = base_path.parent / f"{base_path.stem}_ensemble_{i}.pth"
+        if not path.exists():
+            break
+        model, _ = load_model_checkpoint(path, device)
+        models.append(model)
+        i += 1
+
+    if models:
+        print(f"Loaded ensemble of {len(models)} models")
+    return models
+
+
 def main():
     parser = argparse.ArgumentParser(description='Train digit classifier on SVHN dataset')
     parser.add_argument('--epochs', type=int, default=50, help='Maximum training epochs')
@@ -514,6 +656,7 @@ def main():
     parser.add_argument('--compile', action='store_true', help='Use torch.compile() for faster execution (PyTorch 2.0+)')
     parser.add_argument('--channels-last', action='store_true', help='Use channels_last memory format for better cache utilization')
     parser.add_argument('--multi-dataset', action='store_true', help='Train on SVHN + MNIST for better generalization')
+    parser.add_argument('--ensemble', type=int, default=0, metavar='N', help='Train N models for ensemble (0 = single model)')
     args = parser.parse_args()
 
     # Set device (prefers MPS on Apple Silicon, then CUDA, then CPU)
@@ -531,33 +674,58 @@ def main():
 
     model_path = MODELS_DIR / "model_v1.pth"
 
-    if args.test_only:
-        if model_path.exists():
-            model, _ = load_model_checkpoint(model_path, device)
-            print(f"Loaded model from {model_path}")
-        else:
-            print(f"Error: No model found at {model_path}")
-            return
-        _, _, test_loader = create_dataloaders(train_dataset, val_dataset, test_dataset, args.batch_size, device)
+    # Create dataloaders
+    train_loader, val_loader, test_loader = create_dataloaders(
+        train_dataset, val_dataset, test_dataset, args.batch_size, device
+    )
 
-        # Apply torch.compile if requested (inference only)
-        if args.compile:
-            model = compile_model(model, device, training=False)
+    use_ensemble = args.ensemble > 1
+
+    if args.test_only:
+        # Load and evaluate existing model(s)
+        if use_ensemble:
+            models = load_ensemble(model_path, device)
+            if not models:
+                print(f"Error: No ensemble models found at {model_path.parent}")
+                return
+            accuracy = evaluate_ensemble(models, test_loader, device, use_channels_last=args.channels_last)
+        else:
+            if model_path.exists():
+                model, _ = load_model_checkpoint(model_path, device)
+                print(f"Loaded model from {model_path}")
+            else:
+                print(f"Error: No model found at {model_path}")
+                return
+            if args.compile:
+                model = compile_model(model, device, training=False)
+            accuracy = evaluate_model(model, test_loader, device, use_channels_last=args.channels_last)
+    elif use_ensemble:
+        # Train ensemble
+        print("\n" + "="*50)
+        print(f"TRAINING ENSEMBLE ({args.ensemble} models)")
+        print("="*50)
+        print("Note: The test set is NOT used during training.")
+        print("Data augmentation is applied to training data.\n")
+
+        models, histories = train_ensemble(
+            args.ensemble, train_loader, val_loader, device,
+            epochs=args.epochs, patience=args.patience, lr=args.lr,
+            use_channels_last=args.channels_last
+        )
+
+        # Save ensemble
+        save_ensemble(models, model_path)
+
+        # Evaluate ensemble
+        accuracy = evaluate_ensemble(models, test_loader, device, use_channels_last=args.channels_last)
     else:
-        # Create model
+        # Train single model
         model = DigitCNN(in_channels=3)
         print(f"\nModel architecture:\n{model}")
 
-        # Apply torch.compile if requested (training mode)
         if args.compile:
             model = compile_model(model, device, training=True)
 
-        # Create dataloaders
-        train_loader, val_loader, test_loader = create_dataloaders(
-            train_dataset, val_dataset, test_dataset, args.batch_size, device
-        )
-
-        # Train model
         print("\n" + "="*50)
         print("TRAINING MODEL")
         print("="*50)
@@ -573,8 +741,8 @@ def main():
         # Save model
         save_model(model, model_path)
 
-    # Evaluate on test set
-    accuracy = evaluate_model(model, test_loader, device, use_channels_last=args.channels_last)
+        # Evaluate
+        accuracy = evaluate_model(model, test_loader, device, use_channels_last=args.channels_last)
 
     # Check success criteria
     print("\n" + "="*50)
