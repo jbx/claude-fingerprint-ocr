@@ -354,10 +354,24 @@ def train_model(model, train_loader, val_loader, device, epochs=50, patience=10,
     if use_channels_last:
         model = model.to(memory_format=torch.channels_last)
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
-    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+
+    # Use differential learning rates for pretrained models:
+    # backbone gets a much lower LR to preserve ImageNet features,
+    # classifier head gets the full LR to learn quickly.
+    if isinstance(model, DigitResNet):
+        param_groups = [
+            {'params': model.features.parameters(), 'lr': lr * 0.1},
+            {'params': model.classifier.parameters(), 'lr': lr},
+        ]
+        optimizer = optim.AdamW(param_groups, weight_decay=1e-4)
+        max_lr = [lr, lr * 10]
+    else:
+        optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+        max_lr = lr * 10
+
     scheduler = optim.lr_scheduler.OneCycleLR(
         optimizer,
-        max_lr=lr * 10,
+        max_lr=max_lr,
         epochs=epochs,
         steps_per_epoch=len(train_loader),
         pct_start=0.1
