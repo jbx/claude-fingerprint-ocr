@@ -387,7 +387,8 @@ def train_model(model, train_loader, val_loader, device, epochs=50, patience=10,
             {'params': model.new_parameters(), 'lr': head_lr},
         ]
         optimizer = optim.AdamW(param_groups, weight_decay=1e-4)
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+        total_steps = epochs * len(train_loader)
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps)
     else:
         optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
         scheduler = optim.lr_scheduler.OneCycleLR(
@@ -422,8 +423,7 @@ def train_model(model, train_loader, val_loader, device, epochs=50, patience=10,
             loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
-            if not is_resnet:
-                scheduler.step()  # OneCycleLR steps per batch
+            scheduler.step()  # Both schedulers step per batch
 
             train_loss += loss.item() * inputs.size(0)
             _, predicted = torch.max(outputs, 1)
@@ -432,8 +432,6 @@ def train_model(model, train_loader, val_loader, device, epochs=50, patience=10,
 
         train_loss /= train_total
         train_acc = train_correct / train_total
-        if is_resnet:
-            scheduler.step()  # CosineAnnealingLR steps per epoch
 
         # Validation phase
         model.eval()
