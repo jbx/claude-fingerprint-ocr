@@ -365,8 +365,8 @@ def train_model(model, train_loader, val_loader, device, epochs=50, patience=10,
         backbone_lr = lr * 0.1  # 1e-4 by default
         head_lr = lr            # 1e-3 by default
         param_groups = [
-            {'params': model.features.parameters(), 'lr': backbone_lr},
-            {'params': model.classifier.parameters(), 'lr': head_lr},
+            {'params': model.pretrained_parameters(), 'lr': backbone_lr},
+            {'params': model.new_parameters(), 'lr': head_lr},
         ]
         optimizer = optim.AdamW(param_groups, weight_decay=1e-4)
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
