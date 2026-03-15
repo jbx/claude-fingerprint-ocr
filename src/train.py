@@ -141,7 +141,7 @@ def get_mnist_val_transforms():
     ])
 
 
-def prepare_data(use_multi_dataset=False, use_extra=False, synthetic_count=0):
+def prepare_data(use_multi_dataset=False, use_extra=False, synthetic_count=0, limit_data=0):
     """
     Download and prepare datasets with train/val/test splits.
 
@@ -149,6 +149,7 @@ def prepare_data(use_multi_dataset=False, use_extra=False, synthetic_count=0):
         use_multi_dataset: If True, combine SVHN with MNIST for better generalization
         use_extra: If True, include SVHN 'extra' split (~531K additional samples)
         synthetic_count: If > 0, add this many synthetic digit samples to training
+        limit_data: If > 0, cap total training samples to this number (for fast iteration)
 
     SVHN (Street View House Numbers) contains real-world digit images
     cropped from Google Street View imagery.
@@ -272,6 +273,12 @@ def prepare_data(use_multi_dataset=False, use_extra=False, synthetic_count=0):
         print(f"Training set size: {len(train_dataset)}")
         print(f"Validation set size: {len(val_dataset)}")
         print(f"Test set size (held out): {len(test_dataset)}")
+
+    # Cap training data for fast iteration
+    if limit_data > 0 and len(train_dataset) > limit_data:
+        indices = np.random.RandomState(42).permutation(len(train_dataset))[:limit_data]
+        train_dataset = Subset(train_dataset, indices)
+        print(f"  Limited training to {limit_data} samples (--limit-data)")
 
     return train_dataset, val_dataset, test_dataset
 
@@ -718,6 +725,7 @@ def main():
     parser.add_argument('--multi-dataset', action='store_true', help='Train on SVHN + MNIST for better generalization')
     parser.add_argument('--use-extra', action='store_true', help='Include SVHN extra split (~531K additional training samples)')
     parser.add_argument('--synthetic', type=int, default=0, metavar='N', help='Add N synthetic digit samples to training (e.g. 50000)')
+    parser.add_argument('--limit-data', type=int, default=0, metavar='N', help='Cap training samples to N for fast iteration')
     parser.add_argument('--resnet', action='store_true', help='Use pretrained ResNet-18 backbone instead of custom CNN')
     parser.add_argument('--ensemble', type=int, default=0, metavar='N', help='Train N models for ensemble (0 = single model)')
     args = parser.parse_args()
@@ -735,7 +743,7 @@ def main():
     print("="*50)
     train_dataset, val_dataset, test_dataset = prepare_data(
         use_multi_dataset=args.multi_dataset, use_extra=args.use_extra,
-        synthetic_count=args.synthetic
+        synthetic_count=args.synthetic, limit_data=args.limit_data
     )
 
     model_path = MODELS_DIR / "model_v1.pth"
