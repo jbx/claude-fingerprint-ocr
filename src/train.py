@@ -19,6 +19,7 @@ from sklearn.metrics import accuracy_score, confusion_matrix, classification_rep
 # Add src to path for imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from model import DigitCNN, DigitResNet
+from synthetic import SyntheticDigitDataset
 
 
 # Constants
@@ -41,12 +42,18 @@ def get_train_transforms():
     - Noise and occlusions
     """
     return transforms.Compose([
+        # Scale augmentation: simulate digits occupying different fractions
+        # of the crop (teaches scale invariance to the classifier)
+        transforms.RandomApply([
+            transforms.RandomResizedCrop(32, scale=(0.6, 1.0), ratio=(0.75, 1.33)),
+        ], p=0.3),
+
         # Geometric augmentations
         transforms.RandomRotation(15),
         transforms.RandomAffine(
             degrees=0,
             translate=(0.1, 0.1),
-            scale=(0.9, 1.1),
+            scale=(0.6, 1.2),
             shear=5
         ),
         transforms.RandomPerspective(distortion_scale=0.2, p=0.3),
@@ -134,13 +141,14 @@ def get_mnist_val_transforms():
     ])
 
 
-def prepare_data(use_multi_dataset=False, use_extra=False):
+def prepare_data(use_multi_dataset=False, use_extra=False, synthetic_count=0):
     """
     Download and prepare datasets with train/val/test splits.
 
     Args:
         use_multi_dataset: If True, combine SVHN with MNIST for better generalization
         use_extra: If True, include SVHN 'extra' split (~531K additional samples)
+        synthetic_count: If > 0, add this many synthetic digit samples to training
 
     SVHN (Street View House Numbers) contains real-world digit images
     cropped from Google Street View imagery.
@@ -191,6 +199,16 @@ def prepare_data(use_multi_dataset=False, use_extra=False):
         )
         svhn_train_subset = ConcatDataset([svhn_train_subset, svhn_extra])
         print(f"  SVHN extra: {len(svhn_extra)} samples added to training")
+
+    # === Synthetic Digits (diverse fonts, sizes, colors) ===
+    if synthetic_count > 0:
+        print(f"Adding {synthetic_count} synthetic digit samples...")
+        synthetic_dataset = SyntheticDigitDataset(
+            num_samples=synthetic_count,
+            transform=get_val_transforms(),  # normalization only; diversity comes from rendering
+        )
+        svhn_train_subset = ConcatDataset([svhn_train_subset, synthetic_dataset])
+        print(f"  Synthetic: {synthetic_count} samples added to training")
 
     svhn_test = datasets.SVHN(
         root=DATA_DIR,
@@ -701,6 +719,7 @@ def main():
     parser.add_argument('--channels-last', action='store_true', help='Use channels_last memory format for better cache utilization')
     parser.add_argument('--multi-dataset', action='store_true', help='Train on SVHN + MNIST for better generalization')
     parser.add_argument('--use-extra', action='store_true', help='Include SVHN extra split (~531K additional training samples)')
+    parser.add_argument('--synthetic', type=int, default=0, metavar='N', help='Add N synthetic digit samples to training (e.g. 50000)')
     parser.add_argument('--resnet', action='store_true', help='Use pretrained ResNet-18 backbone instead of custom CNN')
     parser.add_argument('--ensemble', type=int, default=0, metavar='N', help='Train N models for ensemble (0 = single model)')
     args = parser.parse_args()
@@ -717,7 +736,8 @@ def main():
         print("PREPARING DATA (SVHN Dataset)")
     print("="*50)
     train_dataset, val_dataset, test_dataset = prepare_data(
-        use_multi_dataset=args.multi_dataset, use_extra=args.use_extra
+        use_multi_dataset=args.multi_dataset, use_extra=args.use_extra,
+        synthetic_count=args.synthetic
     )
 
     model_path = MODELS_DIR / "model_v1.pth"
