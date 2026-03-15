@@ -358,24 +358,27 @@ def train_model(model, train_loader, val_loader, device, epochs=50, patience=10,
     # Use differential learning rates for pretrained models:
     # backbone gets a much lower LR to preserve ImageNet features,
     # classifier head gets the full LR to learn quickly.
-    if isinstance(model, DigitResNet):
+    # CosineAnnealingLR (no warmup ramp) prevents the divergence that
+    # OneCycleLR causes with pretrained weights.
+    is_resnet = isinstance(model, DigitResNet)
+    if is_resnet:
+        backbone_lr = lr * 0.1  # 1e-4 by default
+        head_lr = lr            # 1e-3 by default
         param_groups = [
-            {'params': model.features.parameters(), 'lr': lr * 0.1},
-            {'params': model.classifier.parameters(), 'lr': lr},
+            {'params': model.features.parameters(), 'lr': backbone_lr},
+            {'params': model.classifier.parameters(), 'lr': head_lr},
         ]
         optimizer = optim.AdamW(param_groups, weight_decay=1e-4)
-        max_lr = [lr, lr * 10]
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     else:
         optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
-        max_lr = lr * 10
-
-    scheduler = optim.lr_scheduler.OneCycleLR(
-        optimizer,
-        max_lr=max_lr,
-        epochs=epochs,
-        steps_per_epoch=len(train_loader),
-        pct_start=0.1
-    )
+        scheduler = optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=lr * 10,
+            epochs=epochs,
+            steps_per_epoch=len(train_loader),
+            pct_start=0.1
+        )
 
     best_val_acc = 0.0
     best_model_state = None
@@ -401,7 +404,8 @@ def train_model(model, train_loader, val_loader, device, epochs=50, patience=10,
             loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
-            scheduler.step()
+            if not is_resnet:
+                scheduler.step()  # OneCycleLR steps per batch
 
             train_loss += loss.item() * inputs.size(0)
             _, predicted = torch.max(outputs, 1)
@@ -410,6 +414,8 @@ def train_model(model, train_loader, val_loader, device, epochs=50, patience=10,
 
         train_loss /= train_total
         train_acc = train_correct / train_total
+        if is_resnet:
+            scheduler.step()  # CosineAnnealingLR steps per epoch
 
         # Validation phase
         model.eval()
