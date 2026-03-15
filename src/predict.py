@@ -15,7 +15,7 @@ from PIL import Image
 
 # Add src to path for imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from model import DigitCNN
+from model import DigitCNN, DigitResNet
 
 
 MODELS_DIR = Path(__file__).parent.parent / "models"
@@ -61,7 +61,11 @@ def load_model(model_path=None, device=None, use_compile=False, use_channels_las
     # Handle both old and new checkpoint formats
     if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
         in_channels = checkpoint.get('in_channels', 3)
-        model = DigitCNN(in_channels=in_channels)
+        architecture = checkpoint.get('architecture', 'cnn')
+        if architecture == 'resnet':
+            model = DigitResNet(in_channels=in_channels, pretrained=False)
+        else:
+            model = DigitCNN(in_channels=in_channels)
         model.load_state_dict(checkpoint['model_state_dict'])
     else:
         model = DigitCNN(in_channels=3)
@@ -96,7 +100,11 @@ def load_ensemble(model_path=None, device=None, use_channels_last=False):
 
         checkpoint = torch.load(path, map_location=device)
         in_channels = checkpoint.get('in_channels', 3)
-        model = DigitCNN(in_channels=in_channels)
+        architecture = checkpoint.get('architecture', 'cnn')
+        if architecture == 'resnet':
+            model = DigitResNet(in_channels=in_channels, pretrained=False)
+        else:
+            model = DigitCNN(in_channels=in_channels)
         model.load_state_dict(checkpoint['model_state_dict'])
         model = model.to(device)
         if use_channels_last:

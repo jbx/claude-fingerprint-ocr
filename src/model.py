@@ -6,6 +6,7 @@ Designed to work with 32x32 RGB images from the SVHN dataset.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torchvision import models
 
 
 class DigitCNN(nn.Module):
@@ -78,6 +79,75 @@ class DigitCNN(nn.Module):
         x = self.dropout2(x)
         x = self.fc3(x)
 
+        return x
+
+    def predict(self, x):
+        """Get predicted class labels."""
+        self.eval()
+        with torch.inference_mode():
+            outputs = self.forward(x)
+            _, predicted = torch.max(outputs, 1)
+        return predicted
+
+    def predict_proba(self, x):
+        """Get class probabilities."""
+        self.eval()
+        with torch.inference_mode():
+            outputs = self.forward(x)
+            probabilities = F.softmax(outputs, dim=1)
+        return probabilities
+
+
+class DigitResNet(nn.Module):
+    """
+    ResNet-18 based digit classifier with pretrained ImageNet weights.
+
+    Uses transfer learning: pretrained convolutional layers extract features,
+    custom classifier head maps to 10 digit classes.
+
+    Input: 32x32 RGB images (3 channels)
+    Output: 10 class probabilities (digits 0-9)
+    """
+
+    def __init__(self, in_channels=3, pretrained=True):
+        super(DigitResNet, self).__init__()
+
+        self.in_channels = in_channels
+
+        # Load pretrained ResNet-18
+        weights = models.ResNet18_Weights.DEFAULT if pretrained else None
+        resnet = models.resnet18(weights=weights)
+
+        # Replace first conv layer if needed (ResNet expects 3 channels)
+        if in_channels != 3:
+            resnet.conv1 = nn.Conv2d(
+                in_channels, 64, kernel_size=7, stride=2, padding=3, bias=False
+            )
+
+        # Use all layers except the final FC
+        self.features = nn.Sequential(
+            resnet.conv1,
+            resnet.bn1,
+            resnet.relu,
+            resnet.maxpool,
+            resnet.layer1,
+            resnet.layer2,
+            resnet.layer3,
+            resnet.layer4,
+        )
+        self.avgpool = resnet.avgpool
+
+        # Custom classifier head
+        self.classifier = nn.Sequential(
+            nn.Dropout(0.3),
+            nn.Linear(512, 10),
+        )
+
+    def forward(self, x):
+        x = self.features(x)
+        x = self.avgpool(x)
+        x = x.flatten(1)
+        x = self.classifier(x)
         return x
 
     def predict(self, x):
