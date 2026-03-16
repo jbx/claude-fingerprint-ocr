@@ -405,7 +405,7 @@ def train_model(model, train_loader, val_loader, device, epochs=50, patience=10,
         )
         total_steps = epochs * len(train_loader)
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps)
-        print(f"Backbone frozen for first {freeze_epochs} epoch(s), then fine-tuned at LR={lr * 0.1:.0e}")
+        print(f"Backbone frozen for first {freeze_epochs} epoch(s), then fine-tuned at LR={lr * 0.01:.0e}")
     else:
         optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
         scheduler = optim.lr_scheduler.OneCycleLR(
@@ -429,7 +429,7 @@ def train_model(model, train_loader, val_loader, device, epochs=50, patience=10,
             for p in model.pretrained_parameters():
                 p.requires_grad = True
             # Rebuild optimizer with both param groups
-            backbone_lr = lr * 0.1
+            backbone_lr = lr * 0.01
             optimizer = optim.AdamW([
                 {'params': model.pretrained_parameters(), 'lr': backbone_lr},
                 {'params': model.new_parameters(), 'lr': head_lr},
