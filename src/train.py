@@ -386,16 +386,26 @@ def train_model(model, train_loader, val_loader, device, epochs=50, patience=10,
     # CosineAnnealingLR (no warmup ramp) prevents the divergence that
     # OneCycleLR causes with pretrained weights.
     is_resnet = isinstance(model, DigitResNet)
+    freeze_epochs = 0
     if is_resnet:
-        backbone_lr = lr * 0.1  # 1e-4 by default
-        head_lr = lr            # 1e-3 by default
-        param_groups = [
-            {'params': model.pretrained_parameters(), 'lr': backbone_lr},
-            {'params': model.new_parameters(), 'lr': head_lr},
-        ]
-        optimizer = optim.AdamW(param_groups, weight_decay=1e-4)
+        # Phase 1: Freeze backbone, train only classifier head.
+        # Phase 2: Unfreeze backbone with low LR for fine-tuning.
+        # This prevents pretrained features from being destroyed on
+        # large datasets where each epoch has many gradient steps.
+        freeze_epochs = max(1, epochs // 10)  # ~10% of training
+        head_lr = lr  # 1e-3 by default
+
+        # Start with backbone frozen
+        for p in model.pretrained_parameters():
+            p.requires_grad = False
+
+        optimizer = optim.AdamW(
+            [p for p in model.parameters() if p.requires_grad],
+            lr=head_lr, weight_decay=1e-4
+        )
         total_steps = epochs * len(train_loader)
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps)
+        print(f"Backbone frozen for first {freeze_epochs} epoch(s), then fine-tuned at LR={lr * 0.1:.0e}")
     else:
         optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
         scheduler = optim.lr_scheduler.OneCycleLR(
@@ -413,6 +423,20 @@ def train_model(model, train_loader, val_loader, device, epochs=50, patience=10,
     history = {'train_loss': [], 'val_loss': [], 'train_acc': [], 'val_acc': []}
 
     for epoch in range(epochs):
+        # Unfreeze backbone after freeze phase
+        if is_resnet and epoch == freeze_epochs:
+            print(f"Unfreezing backbone at epoch {epoch + 1}")
+            for p in model.pretrained_parameters():
+                p.requires_grad = True
+            # Rebuild optimizer with both param groups
+            backbone_lr = lr * 0.1
+            optimizer = optim.AdamW([
+                {'params': model.pretrained_parameters(), 'lr': backbone_lr},
+                {'params': model.new_parameters(), 'lr': head_lr},
+            ], weight_decay=1e-4)
+            remaining_steps = (epochs - epoch) * len(train_loader)
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=remaining_steps)
+
         # Training phase
         model.train()
         train_loss = 0.0
