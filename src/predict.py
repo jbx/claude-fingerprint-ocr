@@ -15,7 +15,7 @@ from PIL import Image
 
 # Add src to path for imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from model import DigitCNN
+from model import DigitCNN, DigitResNet
 
 
 MODELS_DIR = Path(__file__).parent.parent / "models"
@@ -61,7 +61,11 @@ def load_model(model_path=None, device=None, use_compile=False, use_channels_las
     # Handle both old and new checkpoint formats
     if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
         in_channels = checkpoint.get('in_channels', 3)
-        model = DigitCNN(in_channels=in_channels)
+        architecture = checkpoint.get('architecture', 'cnn')
+        if architecture == 'resnet':
+            model = DigitResNet(in_channels=in_channels, pretrained=False)
+        else:
+            model = DigitCNN(in_channels=in_channels)
         model.load_state_dict(checkpoint['model_state_dict'])
     else:
         model = DigitCNN(in_channels=3)
@@ -96,7 +100,11 @@ def load_ensemble(model_path=None, device=None, use_channels_last=False):
 
         checkpoint = torch.load(path, map_location=device)
         in_channels = checkpoint.get('in_channels', 3)
-        model = DigitCNN(in_channels=in_channels)
+        architecture = checkpoint.get('architecture', 'cnn')
+        if architecture == 'resnet':
+            model = DigitResNet(in_channels=in_channels, pretrained=False)
+        else:
+            model = DigitCNN(in_channels=in_channels)
         model.load_state_dict(checkpoint['model_state_dict'])
         model = model.to(device)
         if use_channels_last:
@@ -305,13 +313,60 @@ def extract_single_digit(image):
     return [image[margin:img_h-margin, margin:img_w-margin]]
 
 
-def segment_digits(image, min_area=100, max_area_ratio=0.5):
+def _find_contours_at_scale(gray, scale=1.0):
+    """
+    Run thresholding strategies on a grayscale image and return contours.
+
+    If scale < 1.0, contour coordinates are mapped back to original resolution.
+    """
+    if scale < 1.0:
+        h, w = gray.shape
+        small = cv2.resize(gray, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+    else:
+        small = gray
+
+    sh, sw = small.shape
+    all_contours = []
+
+    # Adaptive blockSize scales with image size (must be odd, >= 3)
+    block_size = max(11, int(min(sh, sw) * 0.03))
+    block_size = block_size if block_size % 2 == 1 else block_size + 1
+
+    # Strategy 1: Adaptive thresholding (good for varying lighting)
+    binary1 = cv2.adaptiveThreshold(
+        small, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV, block_size, 2
+    )
+    contours1, _ = cv2.findContours(binary1, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    all_contours.extend(contours1)
+
+    # Strategy 2: Otsu's thresholding (good for bimodal images)
+    _, binary2 = cv2.threshold(small, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    contours2, _ = cv2.findContours(binary2, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    all_contours.extend(contours2)
+
+    # Strategy 3: Try with light digits on dark background
+    _, binary3 = cv2.threshold(small, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    contours3, _ = cv2.findContours(binary3, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    all_contours.extend(contours3)
+
+    # Map contours back to original resolution
+    if scale < 1.0:
+        inv = 1.0 / scale
+        all_contours = [(c * inv).astype(np.int32) for c in all_contours]
+
+    return all_contours
+
+
+def segment_digits(image, min_area_ratio=0.001, max_area_ratio=0.5):
     """
     Segment individual digits from an image using contour detection.
 
-    Improved segmentation with multiple thresholding strategies.
+    Uses scale-adaptive thresholds so it works on images of any size.
+    For large images, also runs detection on downscaled copies to catch
+    digits that span a large portion of the frame.
 
-    Returns list of (x, digit_image) tuples sorted by x position (left to right).
+    Returns list of digit images sorted by x position (left to right).
     """
     # Convert to grayscale
     if len(image.shape) == 3:
@@ -320,27 +375,22 @@ def segment_digits(image, min_area=100, max_area_ratio=0.5):
         gray = image.copy()
 
     img_height, img_width = gray.shape
+    img_area = img_width * img_height
 
-    # Try multiple thresholding strategies and combine results
-    all_contours = []
+    # Scale-adaptive thresholds
+    min_area = max(25, int(img_area * min_area_ratio))
+    min_w = max(3, int(img_width * 0.01))
+    min_h = max(5, int(img_height * 0.015))
 
-    # Strategy 1: Adaptive thresholding (good for varying lighting)
-    binary1 = cv2.adaptiveThreshold(
-        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV, 11, 2
-    )
-    contours1, _ = cv2.findContours(binary1, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    all_contours.extend(contours1)
+    # Run contour detection at original scale
+    all_contours = _find_contours_at_scale(gray, scale=1.0)
 
-    # Strategy 2: Otsu's thresholding (good for bimodal images)
-    _, binary2 = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    contours2, _ = cv2.findContours(binary2, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    all_contours.extend(contours2)
-
-    # Strategy 3: Try with light digits on dark background
-    _, binary3 = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    contours3, _ = cv2.findContours(binary3, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    all_contours.extend(contours3)
+    # For large images, also try downscaled versions to catch big digits
+    min_dim = min(img_height, img_width)
+    if min_dim > 500:
+        all_contours.extend(_find_contours_at_scale(gray, scale=0.5))
+    if min_dim > 1000:
+        all_contours.extend(_find_contours_at_scale(gray, scale=0.25))
 
     # Filter and deduplicate contours
     digit_regions = []
@@ -349,11 +399,11 @@ def segment_digits(image, min_area=100, max_area_ratio=0.5):
     for contour in all_contours:
         x, y, w, h = cv2.boundingRect(contour)
 
-        # Filter by area
+        # Filter by area (scale-adaptive)
         area = w * h
         if area < min_area:
             continue
-        if area > img_width * img_height * max_area_ratio:
+        if area > img_area * max_area_ratio:
             continue
 
         # Filter by aspect ratio
@@ -361,8 +411,8 @@ def segment_digits(image, min_area=100, max_area_ratio=0.5):
         if aspect_ratio > 2.5 or aspect_ratio < 0.15:
             continue
 
-        # Filter by minimum dimensions
-        if w < 5 or h < 8:
+        # Filter by minimum dimensions (scale-adaptive)
+        if w < min_w or h < min_h:
             continue
 
         # Check for overlap with existing regions

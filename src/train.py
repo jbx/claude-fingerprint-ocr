@@ -18,7 +18,8 @@ from sklearn.metrics import accuracy_score, confusion_matrix, classification_rep
 
 # Add src to path for imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from model import DigitCNN
+from model import DigitCNN, DigitResNet
+from synthetic import SyntheticDigitDataset
 
 
 # Constants
@@ -41,12 +42,18 @@ def get_train_transforms():
     - Noise and occlusions
     """
     return transforms.Compose([
+        # Scale augmentation: simulate digits occupying different fractions
+        # of the crop (teaches scale invariance to the classifier)
+        transforms.RandomApply([
+            transforms.RandomResizedCrop(32, scale=(0.6, 1.0), ratio=(0.75, 1.33)),
+        ], p=0.3),
+
         # Geometric augmentations
         transforms.RandomRotation(15),
         transforms.RandomAffine(
             degrees=0,
             translate=(0.1, 0.1),
-            scale=(0.9, 1.1),
+            scale=(0.6, 1.2),
             shear=5
         ),
         transforms.RandomPerspective(distortion_scale=0.2, p=0.3),
@@ -134,12 +141,15 @@ def get_mnist_val_transforms():
     ])
 
 
-def prepare_data(use_multi_dataset=False):
+def prepare_data(use_multi_dataset=False, use_extra=False, synthetic_count=0, limit_data=0):
     """
     Download and prepare datasets with train/val/test splits.
 
     Args:
         use_multi_dataset: If True, combine SVHN with MNIST for better generalization
+        use_extra: If True, include SVHN 'extra' split (~531K additional samples)
+        synthetic_count: If > 0, add this many synthetic digit samples to training
+        limit_data: If > 0, cap total training samples to this number (for fast iteration)
 
     SVHN (Street View House Numbers) contains real-world digit images
     cropped from Google Street View imagery.
@@ -178,6 +188,28 @@ def prepare_data(use_multi_dataset=False):
 
     svhn_train_subset = Subset(svhn_train, train_indices_svhn)
     svhn_val_subset = Subset(svhn_val_base, val_indices_svhn)
+
+    # === SVHN Extra Split (531K additional training samples) ===
+    if use_extra:
+        print("Downloading/loading SVHN extra split (~531K samples)...")
+        svhn_extra = datasets.SVHN(
+            root=DATA_DIR,
+            split='extra',
+            download=True,
+            transform=get_train_transforms()
+        )
+        svhn_train_subset = ConcatDataset([svhn_train_subset, svhn_extra])
+        print(f"  SVHN extra: {len(svhn_extra)} samples added to training")
+
+    # === Synthetic Digits (diverse fonts, sizes, colors) ===
+    if synthetic_count > 0:
+        print(f"Adding {synthetic_count} synthetic digit samples...")
+        synthetic_dataset = SyntheticDigitDataset(
+            num_samples=synthetic_count,
+            transform=get_val_transforms(),  # normalization only; diversity comes from rendering
+        )
+        svhn_train_subset = ConcatDataset([svhn_train_subset, synthetic_dataset])
+        print(f"  Synthetic: {synthetic_count} samples added to training")
 
     svhn_test = datasets.SVHN(
         root=DATA_DIR,
@@ -241,6 +273,12 @@ def prepare_data(use_multi_dataset=False):
         print(f"Training set size: {len(train_dataset)}")
         print(f"Validation set size: {len(val_dataset)}")
         print(f"Test set size (held out): {len(test_dataset)}")
+
+    # Cap training data for fast iteration
+    if limit_data > 0 and len(train_dataset) > limit_data:
+        indices = np.random.RandomState(42).permutation(len(train_dataset))[:limit_data]
+        train_dataset = Subset(train_dataset, indices)
+        print(f"  Limited training to {limit_data} samples (--limit-data)")
 
     return train_dataset, val_dataset, test_dataset
 
@@ -340,15 +378,43 @@ def train_model(model, train_loader, val_loader, device, epochs=50, patience=10,
     model = model.to(device)
     if use_channels_last:
         model = model.to(memory_format=torch.channels_last)
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
-    scheduler = optim.lr_scheduler.OneCycleLR(
-        optimizer,
-        max_lr=lr * 10,
-        epochs=epochs,
-        steps_per_epoch=len(train_loader),
-        pct_start=0.1
-    )
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+
+    # Use differential learning rates for pretrained models:
+    # backbone gets a much lower LR to preserve ImageNet features,
+    # classifier head gets the full LR to learn quickly.
+    # CosineAnnealingLR (no warmup ramp) prevents the divergence that
+    # OneCycleLR causes with pretrained weights.
+    is_resnet = isinstance(model, DigitResNet)
+    freeze_epochs = 0
+    if is_resnet:
+        # Phase 1: Freeze backbone, train only classifier head.
+        # Phase 2: Unfreeze backbone with low LR for fine-tuning.
+        # This prevents pretrained features from being destroyed on
+        # large datasets where each epoch has many gradient steps.
+        freeze_epochs = max(1, epochs // 10)  # ~10% of training
+        head_lr = lr  # 1e-3 by default
+
+        # Start with backbone frozen
+        for p in model.pretrained_parameters():
+            p.requires_grad = False
+
+        optimizer = optim.AdamW(
+            [p for p in model.parameters() if p.requires_grad],
+            lr=head_lr, weight_decay=1e-4
+        )
+        total_steps = epochs * len(train_loader)
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps)
+        print(f"Backbone frozen for first {freeze_epochs} epoch(s), then fine-tuned at LR={lr * 0.01:.0e}")
+    else:
+        optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+        scheduler = optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=lr * 10,
+            epochs=epochs,
+            steps_per_epoch=len(train_loader),
+            pct_start=0.1
+        )
 
     best_val_acc = 0.0
     best_model_state = None
@@ -357,6 +423,20 @@ def train_model(model, train_loader, val_loader, device, epochs=50, patience=10,
     history = {'train_loss': [], 'val_loss': [], 'train_acc': [], 'val_acc': []}
 
     for epoch in range(epochs):
+        # Unfreeze backbone after freeze phase
+        if is_resnet and epoch == freeze_epochs:
+            print(f"Unfreezing backbone at epoch {epoch + 1}")
+            for p in model.pretrained_parameters():
+                p.requires_grad = True
+            # Rebuild optimizer with both param groups
+            backbone_lr = lr * 0.01
+            optimizer = optim.AdamW([
+                {'params': model.pretrained_parameters(), 'lr': backbone_lr},
+                {'params': model.new_parameters(), 'lr': head_lr},
+            ], weight_decay=1e-4)
+            remaining_steps = (epochs - epoch) * len(train_loader)
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=remaining_steps)
+
         # Training phase
         model.train()
         train_loss = 0.0
@@ -374,7 +454,7 @@ def train_model(model, train_loader, val_loader, device, epochs=50, patience=10,
             loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
-            scheduler.step()
+            scheduler.step()  # Both schedulers step per batch
 
             train_loss += loss.item() * inputs.size(0)
             _, predicted = torch.max(outputs, 1)
@@ -486,9 +566,11 @@ def evaluate_model(model, test_loader, device, use_channels_last=False):
 def save_model(model, filepath):
     """Save model weights and config to file."""
     MODELS_DIR.mkdir(exist_ok=True)
+    architecture = 'resnet' if isinstance(model, DigitResNet) else 'cnn'
     torch.save({
         'model_state_dict': model.state_dict(),
         'in_channels': model.in_channels,
+        'architecture': architecture,
         'svhn_mean': SVHN_MEAN,
         'svhn_std': SVHN_STD,
     }, filepath)
@@ -499,12 +581,16 @@ def load_model_checkpoint(filepath, device):
     """Load model from checkpoint."""
     checkpoint = torch.load(filepath, map_location=device)
     in_channels = checkpoint.get('in_channels', 3)
-    model = DigitCNN(in_channels=in_channels)
+    architecture = checkpoint.get('architecture', 'cnn')
+    if architecture == 'resnet':
+        model = DigitResNet(in_channels=in_channels, pretrained=False)
+    else:
+        model = DigitCNN(in_channels=in_channels)
     model.load_state_dict(checkpoint['model_state_dict'])
     return model, checkpoint
 
 
-def train_ensemble(n_models, train_loader, val_loader, device, epochs=50, patience=10, lr=0.001, use_channels_last=False):
+def train_ensemble(n_models, train_loader, val_loader, device, epochs=50, patience=10, lr=0.001, use_channels_last=False, use_resnet=False):
     """
     Train an ensemble of models with different random seeds.
 
@@ -525,7 +611,10 @@ def train_ensemble(n_models, train_loader, val_loader, device, epochs=50, patien
         np.random.seed(seed)
 
         # Create fresh model
-        model = DigitCNN(in_channels=3)
+        if use_resnet:
+            model = DigitResNet(in_channels=3, pretrained=True)
+        else:
+            model = DigitCNN(in_channels=3)
 
         # Train
         model, history = train_model(
@@ -616,9 +705,11 @@ def save_ensemble(models, base_path):
     paths = []
     for i, model in enumerate(models):
         path = base_path.parent / f"{base_path.stem}_ensemble_{i}.pth"
+        architecture = 'resnet' if isinstance(model, DigitResNet) else 'cnn'
         torch.save({
             'model_state_dict': model.state_dict(),
             'in_channels': model.in_channels,
+            'architecture': architecture,
             'svhn_mean': SVHN_MEAN,
             'svhn_std': SVHN_STD,
             'ensemble_index': i,
@@ -656,6 +747,10 @@ def main():
     parser.add_argument('--compile', action='store_true', help='Use torch.compile() for faster execution (PyTorch 2.0+)')
     parser.add_argument('--channels-last', action='store_true', help='Use channels_last memory format for better cache utilization')
     parser.add_argument('--multi-dataset', action='store_true', help='Train on SVHN + MNIST for better generalization')
+    parser.add_argument('--use-extra', action='store_true', help='Include SVHN extra split (~531K additional training samples)')
+    parser.add_argument('--synthetic', type=int, default=0, metavar='N', help='Add N synthetic digit samples to training (e.g. 50000)')
+    parser.add_argument('--limit-data', type=int, default=0, metavar='N', help='Cap training samples to N for fast iteration')
+    parser.add_argument('--resnet', action='store_true', help='Use pretrained ResNet-18 backbone instead of custom CNN')
     parser.add_argument('--ensemble', type=int, default=0, metavar='N', help='Train N models for ensemble (0 = single model)')
     args = parser.parse_args()
 
@@ -670,7 +765,10 @@ def main():
     else:
         print("PREPARING DATA (SVHN Dataset)")
     print("="*50)
-    train_dataset, val_dataset, test_dataset = prepare_data(use_multi_dataset=args.multi_dataset)
+    train_dataset, val_dataset, test_dataset = prepare_data(
+        use_multi_dataset=args.multi_dataset, use_extra=args.use_extra,
+        synthetic_count=args.synthetic, limit_data=args.limit_data
+    )
 
     model_path = MODELS_DIR / "model_v1.pth"
 
@@ -710,7 +808,7 @@ def main():
         models, histories = train_ensemble(
             args.ensemble, train_loader, val_loader, device,
             epochs=args.epochs, patience=args.patience, lr=args.lr,
-            use_channels_last=args.channels_last
+            use_channels_last=args.channels_last, use_resnet=args.resnet
         )
 
         # Save ensemble
@@ -720,7 +818,11 @@ def main():
         accuracy = evaluate_ensemble(models, test_loader, device, use_channels_last=args.channels_last)
     else:
         # Train single model
-        model = DigitCNN(in_channels=3)
+        if args.resnet:
+            model = DigitResNet(in_channels=3, pretrained=True)
+            print("\nUsing pretrained ResNet-18 backbone")
+        else:
+            model = DigitCNN(in_channels=3)
         print(f"\nModel architecture:\n{model}")
 
         if args.compile:
